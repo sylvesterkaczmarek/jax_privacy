@@ -69,6 +69,7 @@ from . import accounting
 from . import batch_selection
 from . import clipping
 from . import noise_addition
+from . import sharding_utils
 from .matrix_factorization import toeplitz
 
 NeighboringRelation = dp_accounting.NeighboringRelation
@@ -111,9 +112,15 @@ class PerformanceFlags:
       sharding behavior for noise addition.
     microbatch_size: If set, per-example gradient computation is broken into
       sequential microbatches to reduce peak memory at the cost of compute.
-    spmd_axis_name: Axis name for distributed vmap in SPMD settings.
+    batch_axis_name: Mesh axis name (or tuple of axis names) along which the
+      batch dimension is sharded in SPMD settings.
+    spmd_axis_name: Deprecated alias for ``batch_axis_name``.
     keep_batch_dim: Whether to keep the batch dimension when computing
       per-example gradients.
+    param_specs: Optional PyTree of ``jax.sharding.PartitionSpec`` (or prefix
+      thereof) matching the parameter PyTree structure. When set, wraps the
+      noise addition transform with
+      :func:`~jax_privacy.sharding_utils.with_sharding_specs`.
   """
 
   dtype: jax.typing.DTypeLike = np.float32
@@ -122,8 +129,17 @@ class PerformanceFlags:
       noise_addition.SupportedStrategies.DEFAULT
   )
   microbatch_size: int | None = None
-  spmd_axis_name: str | None = None
+  batch_axis_name: str | tuple[str, ...] | None = None
+  # Deprecated alias for batch_axis_name; remove in next release.
+  spmd_axis_name: str | tuple[str, ...] | None = None
   keep_batch_dim: bool = True
+  param_specs: sharding_utils.PartitionSpecPyTree | None = None
+
+  def __post_init__(self):
+    if self.spmd_axis_name is not None:
+      if self.batch_axis_name is not None:
+        raise ValueError('Cannot set both batch_axis_name and spmd_axis_name.')
+      object.__setattr__(self, 'batch_axis_name', self.spmd_axis_name)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -536,7 +552,7 @@ class BandMFConfig:
           rescale_to_unit_norm=self.rescale_to_unit_norm,
           dtype=performance_flags.dtype,
           microbatch_size=performance_flags.microbatch_size,
-          spmd_axis_name=performance_flags.spmd_axis_name,
+          spmd_axis_name=performance_flags.batch_axis_name,
           keep_batch_dim=performance_flags.keep_batch_dim,
       )
 
@@ -560,9 +576,13 @@ class BandMFConfig:
 
     max_column_norm = self._max_column_norm
     column_normalize_for_n = self.iterations if self.column_normalize else None
-    noising_matrix = toeplitz.inverse_as_streaming_matrix(
-        self.strategy, column_normalize_for_n
-    )
+    # Keep closed-over Toeplitz coefficients uncommitted so shard_map in
+    # with_sharding_specs does not see AxisType.Auto constants; np.asarray
+    # strips any mesh sharding already attached to self.strategy.
+    with jax.set_mesh(None):
+      noising_matrix = toeplitz.inverse_as_streaming_matrix(
+          np.asarray(self.strategy), column_normalize_for_n
+      )
 
     query_sensitivity = clipped_grad_transform(lambda: None).sensitivity()
 
@@ -577,6 +597,10 @@ class BandMFConfig:
         dtype=performance_flags.dtype,
         intermediate_strategy=performance_flags.intermediate_strategy,
     )
+    if performance_flags.param_specs is not None:
+      privatizer = sharding_utils.with_sharding_specs(
+          privatizer, performance_flags.param_specs
+      )
 
     return DPExecutionPlan(
         clipped_grad=clipped_grad_transform,
@@ -620,7 +644,7 @@ class NonPrivateConfig:
           rescale_to_unit_norm=False,
           dtype=performance_flags.dtype,
           microbatch_size=performance_flags.microbatch_size,
-          spmd_axis_name=performance_flags.spmd_axis_name,
+          spmd_axis_name=performance_flags.batch_axis_name,
           keep_batch_dim=performance_flags.keep_batch_dim,
       )
 

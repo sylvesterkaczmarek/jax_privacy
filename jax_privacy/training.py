@@ -31,13 +31,17 @@ Callers are expected to implement these things themselves via dependency
 injection through the callback_fn option.
 """
 
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+import copy
 import dataclasses
 import functools
-from typing import Any, Protocol, TypeAlias
+import itertools
+from typing import Protocol, TypeAlias
+import zlib
 
 from absl import logging
 import jax
+from jax.experimental import multihost_utils
 import jax_privacy
 from jax_privacy import _compilation
 from jax_privacy import _validate
@@ -57,7 +61,7 @@ Loss: TypeAlias = jax.Array
 Aux: TypeAlias = optax.ArrayTree
 PerExampleAux: TypeAlias = jax_privacy.clipping.AuxiliaryOutput
 Batch: TypeAlias = optax.ArrayTree
-Dataset: TypeAlias = optax.ArrayTree | Any
+Dataset: TypeAlias = optax.ArrayTree
 Params: TypeAlias = optax.ArrayTree
 OptState: TypeAlias = optax.ArrayTree
 NoiseState: TypeAlias = optax.ArrayTree
@@ -122,37 +126,50 @@ class TrainingState:
 CallbackFn: TypeAlias = Callable[[int, TrainingState, PerExampleAux], None]
 
 
-def _get_batch(
-    dataset: Dataset, indices: np.ndarray
-) -> tuple[Batch, jax.Array]:
-  """Retrieves a batch from a PyTree or Grain dataset, zeroing padding examples.
-
-  Args:
-    dataset: A PyTree of arrays or a PyGrain MapDataset.
-    indices: A 1D array of indices. Entries equal to ``-1`` are treated as
-      padding and the corresponding examples are zeroed out.
-
-  Returns:
-    A tuple ``(batch, is_padding)`` where ``batch`` is the indexed and
-    zero-padded PyTree and ``is_padding`` is a boolean array indicating
-    which examples are padding.
-  """
-  is_padding = indices == -1
-
-  if _compilation.is_map_dataset(dataset):
-    template = jax.tree.map(np.zeros_like, dataset[0])
-    batch_elements = [template if i == -1 else dataset[i] for i in indices]
-    batch_elements = batch_elements or [template]
-    batch = jax.tree.map(
-        lambda *leaves: np.stack(leaves)[: len(indices)], *batch_elements
+def _batch_iterator(
+    dataset: Dataset,
+    strategy: batch_selection.BatchSelectionStrategy,
+    *,
+    rng: batch_selection.RngType = None,
+    pad_to_multiple_of: int = 1,
+    microbatch_size: int | None = None,
+    initial_step: int = 0,
+    sharding: jax.sharding.NamedSharding | None = None,
+) -> Iterator[tuple[Batch, jax.Array]]:
+  """Yields padded (batch, is_padding_example) pairs from dataset."""
+  num_examples = _validate.batch(dataset)
+  if jax.process_count() > 1:
+    crcs = [zlib.crc32(x[:1].tobytes()) for x in jax.tree.leaves(dataset)]
+    seed = copy.deepcopy(np.random.default_rng(rng)).integers(2**63)
+    multihost_utils.assert_equal(
+        (seed, *crcs), "dataset and rng must match across all JAX processes"
     )
-    return batch, jax.device_put(is_padding)
+  index_iterator = strategy.batch_iterator(num_examples, rng=rng)
 
-  def _index_and_zero(x):
-    mask = np.expand_dims(is_padding, tuple(range(1, x.ndim)))
-    return jax.device_put(np.where(mask, 0, x[indices]))
+  # When sharding across a mesh (including multi-controller JAX),
+  # make_array_from_callback slices and transfers only the process-addressable
+  # shards to HBM. In multi-controller setups, every process must hold the
+  # full dataset and use the same rng so each process samples the same global
+  # batch indices before slicing its local device shards.
+  def _to_device(x: np.ndarray) -> jax.Array:
+    if sharding is None:
+      return jax.device_put(x)
+    return jax.make_array_from_callback(x.shape, sharding, lambda idx: x[idx])
 
-  return jax.tree.map(_index_and_zero, dataset), jax.device_put(is_padding)
+  # Fast-forward the index iterator to initial_step when resuming from a
+  # checkpoint, without materializing or transferring skipped batches.
+  # TODO: Investigate stateful iterator instead of rng replay.
+  for indices in itertools.islice(index_iterator, initial_step, None):
+    indices = batch_selection.pad_to_multiple_of(
+        indices, pad_to_multiple_of, microbatch_size=microbatch_size
+    )
+    is_padding = indices == -1
+
+    def _index_and_zero(x, is_padding=is_padding, indices=indices):
+      mask = np.expand_dims(is_padding, tuple(range(1, x.ndim)))
+      return _to_device(np.where(mask, 0, x[indices]))
+
+    yield jax.tree.map(_index_and_zero, dataset), _to_device(is_padding)
 
 
 # DPTrainer contains static configuration that defines the training step, but
@@ -168,11 +185,13 @@ class DPTrainer:
   ``train_step`` method available as a standalone callable that can be
   compiled or used independently of the training loop.
 
-  **Sharding**: This class does not shard params or data.  For
-  multi-device training, provide ``params`` with explicit sharding
-  annotations and configure ``spmd_axis_name`` through
-  ``performance_flags``.  If data sharding is needed, ``loss_fn``
-  should reshard its inputs using sharding-in-types.
+  **Sharding**: For multi-device training inside a :func:`jax.set_mesh`
+  context, provide ``params`` sharded on the active mesh and configure
+  ``batch_axis_name`` through ``performance_flags``. When ``batch_axis_name``
+  is set and a mesh is active, :meth:`fit` shards the batch dimension of each
+  batch and padding mask along ``PartitionSpec(batch_axis_name)``. In
+  multi-controller setups (``jax.process_count() > 1``), every process must
+  pass the full ``dataset`` and an identical ``rng_or_seed`` to :meth:`fit`.
 
   Attributes:
     config: An :class:`~jax_privacy.execution_plan.ExecutionPlanConfig` (e.g.
@@ -307,9 +326,8 @@ class DPTrainer:
     """Runs an end-to-end differentially private training loop.
 
     Args:
-      dataset: The training dataset, either as a PyTree of arrays where the
-        first axis of each leaf is the batch / example dimension, or as a
-        ``grain.MapDataset``.
+      dataset: The training dataset, as a PyTree of arrays where the first axis
+        of each leaf is the batch / example dimension.
       state: Initial parameter PyTree or a resumable ``TrainingState``. If a
         ``TrainingState`` is provided, training continues from the step recorded
         in the state, and the batch selection iterator safely fast-forwards to
@@ -352,42 +370,32 @@ class DPTrainer:
     rng = np.random.default_rng(rng_or_seed)
     prng_key = jax.random.key(int(rng.integers(2**63)))
 
-    num_examples = (
-        len(dataset)
-        if _compilation.is_map_dataset(dataset)
-        else _validate.batch(dataset)
-    )
-
     with _compilation.hoist_closed_over_constants():
-      bss = trainer.plan.batch_selection_strategy
-      batch_iterator = bss.batch_iterator(num_examples, rng=rng)
-
-      # initial state.step is 0 (no replay). Otherwise replay to the saved step.
-      # TODO: b/545416482 - Investigate stateful iterator instead of rng replay.
-      for _ in range(int(state.step)):
-        next(batch_iterator)
+      axis = trainer.performance_flags.batch_axis_name
+      batches = _batch_iterator(
+          dataset,
+          trainer.plan.batch_selection_strategy,
+          rng=rng,
+          pad_to_multiple_of=trainer.compilation_strategy.multiple,
+          microbatch_size=trainer.performance_flags.microbatch_size,
+          initial_step=int(state.step),
+          sharding=_compilation.batch_sharding(axis),
+      )
 
       step = int(state.step)
-      for indices in batch_iterator:
-        indices = batch_selection.pad_to_multiple_of(
-            indices,
-            trainer.compilation_strategy.multiple,
-            microbatch_size=trainer.performance_flags.microbatch_size,
-        )
-        batch, is_padding_example = _get_batch(dataset, indices)
+      for batch, is_padding_example in batches:
+        batch_size = is_padding_example.size
         step_fn = trainer.train_step
-        if indices.size in futures:
-          step_fn = futures[indices.size].result()
+        if batch_size in futures:
+          step_fn = futures[batch_size].result()
         elif warn_on_cache_miss:
-          logging.info(
-              "JIT-compiling train_step for batch size %d", indices.size
-          )
+          logging.info("JIT-compiling train_step for batch size %d", batch_size)
           logging.warning("Cache Miss! Precompile is not working as intended.")
 
         state, aux = step_fn(state, batch, is_padding_example, prng_key)
         step += 1
 
-        del indices, batch, is_padding_example
+        del batch, is_padding_example
 
         if callback is not None:
           callback(step, state, aux)

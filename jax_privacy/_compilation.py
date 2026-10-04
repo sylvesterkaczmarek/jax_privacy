@@ -30,7 +30,7 @@ import contextlib
 import copy
 import dataclasses
 import functools
-from typing import Any, TYPE_CHECKING, TypeAlias
+from typing import TYPE_CHECKING, TypeAlias
 
 from absl import logging
 import jax
@@ -88,30 +88,26 @@ class AutotuneMicrobatch:
 CompilationStrategy: TypeAlias = PadToMultiple | AutotuneMicrobatch
 
 
-def is_map_dataset(dataset: Any) -> bool:
-  """Returns whether ``dataset`` is a PyGrain MapDataset.
-
-  This function does not import Grain.
-
-  Args:
-    dataset: the dataset which is to be queried.
-  """
-
-  names = [c.__name__ for c in type(dataset).__mro__]
-  return any(x in ("MapDataset", "RandomAccessDataSource") for x in names)
+def batch_sharding(
+    batch_axis_name: str | tuple[str, ...] | None = None,
+) -> jax.sharding.NamedSharding | None:
+  """Returns the batch NamedSharding for the active mesh, or None."""
+  mesh = jax.sharding.get_mesh()
+  if batch_axis_name is None or mesh.empty:
+    return None
+  spec = jax.sharding.PartitionSpec(batch_axis_name)
+  return jax.sharding.NamedSharding(mesh, spec)
 
 
-def _abstract_batch_and_padding(dataset, size):
+def _abstract_batch_and_padding(dataset, size, sharding=None):
   """Returns abstract ``(batch, is_padding)`` inputs of the given size."""
-  if is_map_dataset(dataset):
-    dataset, dim = dataset[0], 0
-  else:
-    dim = 1
-  batch = jax.tree.map(
-      lambda x: jax.ShapeDtypeStruct((size, *x.shape[dim:]), x.dtype), dataset
-  )
-  padding = jax.ShapeDtypeStruct((size,), np.bool_)
-  return batch, padding
+
+  def _to_abstract(x):
+    return jax.ShapeDtypeStruct(
+        (size, *x.shape[1:]), x.dtype, sharding=sharding
+    )
+
+  return jax.tree.map(_to_abstract, dataset), _to_abstract(np.bool_(False))
 
 
 def _dry_run_state(
@@ -123,7 +119,7 @@ def _dry_run_state(
   """Eval-shape setup; draws the same rng as training for JIT cache hits."""
   rng = copy.deepcopy(np.random.default_rng(rng_or_seed))
   seed = rng.integers(2**63)
-  n = len(dataset) if is_map_dataset(dataset) else _validate.batch(dataset)
+  n = _validate.batch(dataset)
   state = jax.eval_shape(trainer.init, params)
   key = jax.eval_shape(lambda x: x, jax.random.key(seed))
   return rng, n, state, key
@@ -162,6 +158,7 @@ def precompile(
   # This rng matches the one used in training, so even though the batch iterator
   # is stochastic, the batch sizes and hence compiled functions will match.
   rng, n, state, key = _dry_run_state(trainer, dataset, params, rng_or_seed)
+  sharding = batch_sharding(trainer.performance_flags.batch_axis_name)
   batch_strategy = trainer.plan.batch_selection_strategy
   futures: dict[int, PrecompiledFuture] = {}
   with hoist_closed_over_constants():
@@ -170,11 +167,11 @@ def precompile(
       batch_size = padded.size
       if batch_size in futures:
         continue
-      batch, padding = _abstract_batch_and_padding(dataset, batch_size)
+      batch, pad = _abstract_batch_and_padding(dataset, batch_size, sharding)
 
       # The compilation cache leaks the compiled batch size(s), which depend on
       # the sampled batches -- a technical DP violation if it is part of output.
-      lowered = trainer.train_step.lower(trainer, state, batch, padding, key)
+      lowered = trainer.train_step.lower(trainer, state, batch, pad, key)
       logging.info("AOT-compiling train_step for batch size %d", batch_size)
       # We asyncronously ahead-of-time (AOT) compile the lowered function in a
       # background thread to avoid blocking the training loop. Currently, the
@@ -257,6 +254,7 @@ def _autotune(
   budget = limit * hbm_safety_fraction if limit is not None else None
 
   rng, n, state, key = _dry_run_state(trainer, dataset, params, rng_or_seed)
+  sharding = batch_sharding(trainer.performance_flags.batch_axis_name)
   batch_strategy = trainer.plan.batch_selection_strategy
   max_batch = max(idx.size for idx in batch_strategy.batch_iterator(n, rng=rng))
   powers = [2**i for i in range(max_batch.bit_length())]
@@ -276,7 +274,7 @@ def _autotune(
     """Compile-verifies a microbatch size and measures its peak (memoized)."""
     pad = int(-(-max_batch // microbatch) * microbatch)
     resolved = _resolve(microbatch, pad)
-    batch, padding = _abstract_batch_and_padding(dataset, pad)
+    batch, padding = _abstract_batch_and_padding(dataset, pad, sharding)
     compiled, peak = _compile_and_peak(resolved, state, batch, padding, key)
     fits = compiled is not None and (budget is None or peak <= budget)
     return _Candidate(
